@@ -7,11 +7,11 @@ model_name: s # model size (n, s, m, l, x)
 
 train:
   ### Paths ###
-  root: /home/argo/Desktop/Projects/vis_drone # project root with dataset and outputs
-  pretrained_dataset: coco # coco, obj2coco
+  root: /home/samal/smol_data/ # project root with dataset and outputs
+  pretrained_dataset: obj2coco # coco, obj2coco
   pretrained_model_path: pretrained/dfine_${model_name}_${train.pretrained_dataset}.pth # dfine_m_obj2coco.pth
 
-  data_path: ${train.root}/data/dataset # path to dataset
+  data_path: ${train.root} # path to dataset
   path_to_test_data: ${train.root}/VisDrone2019-DET-test-dev/images  # path to test set, used in infer script
   path_to_save: ${train.root}/output/models/${exp} # where to save output
 
@@ -21,21 +21,12 @@ train:
   infer_path: ${train.root}/output/infer
 
   ### Configs ###
-  use_wandb: True
-  device: cuda
+  use_wandb: False
+  device: cuda:1
   label_to_name: # dataset's classes
-    0: pedestrian
-    1: people
-    2: bicycle
-    3: car
-    4: van
-    5: truck
-    6: tricycle
-    7: awning-tricycle
-    8: bus
-    9: motor
+    0: ball
 
-  use_one_class: False
+  use_one_class: True
 
   decision_metrics:
   - f1
@@ -49,10 +40,10 @@ train:
   amp_enabled: True # use automatic mixed precision
   clip_max_norm: 0.1 # gradient clipping
 
-  batch_size: 8 # physical, should fit on the device
+  batch_size: 40 #8 # physical, should fit on the device
   b_accum_steps: 1 # grad accumulation (n * bs)
   epochs: 55
-  early_stopping: 0 # 0 - no early stopping
+  early_stopping: 4 # 0 - no early stopping
   ignore_background_epochs: 0 # background images are not used for N epochs in train set
   num_workers: 12
 
@@ -119,7 +110,7 @@ train:
 
 
 split:
-  ignore_negatives: False # only use images with labels
+  ignore_negatives: True #False # only use images with labels
   shuffle: True
   train_split: 0.85
   val_split: 0.15 # test_split = 1 - train_split - val_split
