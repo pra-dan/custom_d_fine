@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import torch
 import wandb
+import torch.distributed as dist
 from albumentations.core.transforms_interface import DualTransform
 from loguru import logger
 from tabulate import tabulate
@@ -671,7 +672,10 @@ class LetterboxRect(DualTransform):
 
         return b
 
-def setup_ddp():#self.rank, self.local_rank, self.world_size =
+def setup_ddp():
+    """
+    Initializes the DDP process group
+    """
     num_gpus = torch.accelerator.device_count()
     assert num_gpus >= 2, f"DDP requires > 2 GPUs but got {num_gpus}"
 
@@ -680,7 +684,17 @@ def setup_ddp():#self.rank, self.local_rank, self.world_size =
     rank = int(os.environ.get("RANK", 0))
 
     if world_size > 1:
-        dist.init_process_group(backend='nccl', init_method="env://")
+        dist.init_process_group(backend="nccl", init_method="env://")
+        # Pin this process to its local GPU
         torch.cuda.set_device(local_rank)
 
     return rank, local_rank, world_size
+
+def get_rank() -> int:
+    return dist.get_rank()
+
+def is_main_process() -> bool:
+    """
+    Checks if the current process is rank 0 
+    """
+    return get_rank() == 0

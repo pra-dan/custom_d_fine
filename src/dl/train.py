@@ -15,6 +15,8 @@ from omegaconf import DictConfig, OmegaConf
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
+from torch.nn import SyncBatchNorm
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
 from src.d_fine.dfine import build_loss, build_model, build_optimizer
@@ -30,6 +32,8 @@ from src.dl.utils import (
     set_seeds,
     visualize,
     wandb_logger,
+    setup_ddp,
+    is_main_process,
 )
 from src.dl.validator import Validator
 
@@ -469,22 +473,44 @@ class Trainer_DDP(Trainer):
         # Set up DDP env
         # This must run before parent constructor
         self.rank, self.local_rank, self.world_size = setup_ddp()
+        # Ensure each process uses a distinct CUDA device
         self.rank_zero_device = f"cuda:{self.local_rank}"
+        # Override device in config so parent Trainer builds model/loaders on the correct GPU
+        cfg.train.device = self.rank_zero_device
 
         # trigger parent class constructor
-        super().__init__()
+        super().__init__(cfg)
+
+        # wrap the model built by parent trainer
+        if is_main_process():
+            logger.info("Converting model to SyncBatchNorm and wrapping with DDP...")
+        self.model = SyncBatchNorm.convert_sync_batchnorm(self.model).to(self.rank_zero_device)
+        self.model = DDP(self.model, device_ids=[self.local_rank])
+
+        if self.cfg.train.use_ema:
+            if is_main_process():
+                logger.info("Re-initialising EMA model for DDP")
+            # NOTE: use cfg.train (not cfg.trian) and the underlying module for EMA
+            self.ema_model = ModelEMA(self.model.module, cfg.train.ema_momentum)
+        
 
 @hydra.main(version_base=None, config_path="../../", config_name="config")
 def main(cfg: DictConfig) -> None:
-    trainer = Trainer(cfg) if cfg.train.ddp else Trainer_DDP(cfg)
-    exit(0)
+    
+    if cfg.train.ddp:
+        trainer = Trainer_DDP(cfg)
+    else:
+        trainer = Trainer(cfg)
+
     try:
         t_start = time.time()
         trainer.train()
     except KeyboardInterrupt:
-        logger.warning("Interrupted by user")
+        if is_main_process(): # Use DDP-aware check
+            logger.warning("Interrupted by user")
     except Exception as e:
-        logger.error(e)
+        if is_main_process():
+            logger.error(e)
     finally:
         logger.info("Evaluating best model...")
         cfg.exp = get_latest_experiment_name(cfg.exp, cfg.train.path_to_save)
