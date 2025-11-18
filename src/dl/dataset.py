@@ -11,6 +11,8 @@ from albumentations.pytorch import ToTensorV2
 from loguru import logger
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader, Dataset
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler 
 
 from src.dl.utils import (
     LetterboxRect,
@@ -20,6 +22,7 @@ from src.dl.utils import (
     random_affine,
     seed_worker,
     vis_one_box,
+    is_main_process,
 )
 
 
@@ -365,7 +368,7 @@ class Loader:
         images = images.intersection(split_images)
         return len(images - labels)
 
-    def _build_dataloader_impl(self, dataset: Dataset, shuffle: bool = False) -> DataLoader:
+    def _build_dataloader_impl(self, dataset: Dataset, shuffle: bool = False, sampler=None) -> DataLoader:
         collate_fn = self.val_collate_fn
         if dataset.mode == "train":
             collate_fn = self.train_collate_fn
@@ -375,6 +378,7 @@ class Loader:
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             shuffle=shuffle,
+            sampler=sampler,
             collate_fn=collate_fn,
             worker_init_fn=seed_worker,
             prefetch_factor=4,
@@ -400,8 +404,11 @@ class Loader:
             cfg=self.cfg,
         )
 
-        train_loader = self._build_dataloader_impl(train_ds, shuffle=True)
-        val_loader = self._build_dataloader_impl(val_ds)
+        train_sampler = DistributedSampler(train_ds, shuffle=True) if dist.is_initialized() else None
+        val_sampler = DistributedSampler(val_ds, shuffle=False) if dist.is_initialized() else None
+
+        train_loader = self._build_dataloader_impl(train_ds, shuffle=(train_sampler is None), sampler=train_sampler)
+        val_loader = self._build_dataloader_impl(val_ds, sampler=val_sampler)
 
         test_loader = None
         test_ds = []
@@ -414,14 +421,17 @@ class Loader:
                 mode="test",
                 cfg=self.cfg,
             )
-            test_loader = self._build_dataloader_impl(test_ds)
+            test_sampler = DistributedSampler(test_ds, shuffle=False) if dist.is_initialized() else None
+            test_loader = self._build_dataloader_impl(test_ds, sampler=test_sampler)
 
-        logger.info(f"Images in train: {len(train_ds)}, val: {len(val_ds)}, test: {len(test_ds)}")
-        obj_stats = self._get_label_stats()
-        logger.info(
-            f"Objects count: {', '.join(f'{key}: {value}' for key, value in obj_stats.items())}"
-        )
-        logger.info(f"Background images: {self._get_amount_of_background()}")
+        if is_main_process():
+            logger.info(f"Images in train: {len(train_ds)}, val: {len(val_ds)}, test: {len(test_ds)}")
+            obj_stats = self._get_label_stats()
+            logger.info(
+                f"Objects count: {', '.join(f'{key}: {value}' for key, value in obj_stats.items())}"
+            )
+            logger.info(f"Background images: {self._get_amount_of_background()}")
+
         return train_loader, val_loader, test_loader
 
     def _collate_fn(self, batch) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
