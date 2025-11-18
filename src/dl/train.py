@@ -33,7 +33,6 @@ from src.dl.utils import (
 )
 from src.dl.validator import Validator
 
-
 class ModelEMA:
     def __init__(self, student, ema_momentum):
         self.model = deepcopy(student).eval()
@@ -49,7 +48,6 @@ class ModelEMA:
                 if param.dtype.is_floating_point:
                     param *= momentum
                     param += (1.0 - momentum) * student[name].detach()
-
 
 class Trainer:
     def __init__(self, cfg: DictConfig) -> None:
@@ -466,11 +464,20 @@ class Trainer:
                 logger.info("Early stopping")
                 break
 
+class Trainer_DDP(Trainer):
+    def __init__(self, cfg: DictConfig) -> None:
+        # Set up DDP env
+        # This must run before parent constructor
+        self.rank, self.local_rank, self.world_size = setup_ddp()
+        self.rank_zero_device = f"cuda:{self.local_rank}"
+
+        # trigger parent class constructor
+        super().__init__()
 
 @hydra.main(version_base=None, config_path="../../", config_name="config")
 def main(cfg: DictConfig) -> None:
-    trainer = Trainer(cfg)
-
+    trainer = Trainer(cfg) if cfg.train.ddp else Trainer_DDP(cfg)
+    exit(0)
     try:
         t_start = time.time()
         trainer.train()

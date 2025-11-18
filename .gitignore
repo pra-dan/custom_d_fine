@@ -2,6 +2,9 @@
 __pycache__/
 *.py[cod]
 *$py.class
+# temp exp files [this section is to be removed at last]
+popo.md
+run.sh
 
 # C extensions
 *.so

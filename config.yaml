@@ -22,7 +22,8 @@ train:
 
   ### Configs ###
   use_wandb: False
-  device: cuda:1
+  ddp: True # toggled using CLI 
+  device: cuda:1 # only for single-gpu training | For DDP, this is the rank 0 device
   label_to_name: # dataset's classes
     0: ball
 
