@@ -166,6 +166,13 @@ def load_tuning_state(model, path: str):
     else:
         pretrain_state_dict = state
 
+    # strip 'module.' prefix from DDP models
+    new_state_dict = OrderedDict()
+    for k, v in pretrain_state_dict.items():
+        name = k[7:] if k.startswith('module.') else k # remove `module.`
+        new_state_dict[name] = v
+    pretrain_state_dict = new_state_dict
+
     # Adjust head parameters between datasets
     try:
         adjusted_state_dict = adjust_head_parameters(model.state_dict(), pretrain_state_dict)
