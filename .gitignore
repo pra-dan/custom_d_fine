@@ -5,6 +5,7 @@ __pycache__/
 # temp exp files [this section is to be removed at last]
 popo.md
 run.sh
+delete
 
 # C extensions
 *.so
