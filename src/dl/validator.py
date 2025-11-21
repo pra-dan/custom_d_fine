@@ -273,6 +273,9 @@ class Validator:
         return metrics_per_class, conf_matrix, class_to_idx
 
     def save_plots(self, path_to_save) -> None:
+        if not is_main_process():
+            return
+            
         path_to_save = Path(path_to_save)
         path_to_save.mkdir(parents=True, exist_ok=True)
 
