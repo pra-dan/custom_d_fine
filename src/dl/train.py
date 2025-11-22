@@ -8,6 +8,7 @@ from typing import Dict, List, Tuple
 import hydra
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import wandb
 from loguru import logger
@@ -57,7 +58,7 @@ class ModelEMA:
 class Trainer:
     def __init__(self, cfg: DictConfig) -> None:
         self.cfg = cfg
-        self.device = cfg.train.device
+        self.device = torch.device(cfg.train.device)
         self.conf_thresh = cfg.train.conf_thresh
         self.iou_thresh = cfg.train.iou_thresh
         self.epochs = cfg.train.epochs
@@ -239,7 +240,7 @@ class Trainer:
         for idx, (inputs, targets, img_paths) in enumerate(val_loader):
             inputs = inputs.to(self.device)
             if self.amp_enabled:
-                with autocast(self.device, cache_enabled=True):
+                with autocast(self.device.type, cache_enabled=True):
                     raw_res = model(inputs)
             else:
                 raw_res = model(inputs)
@@ -397,9 +398,9 @@ class Trainer:
                     lr = self.optimizer.param_groups[-1]["lr"]
 
                     if self.amp_enabled:
-                        with autocast(self.device, cache_enabled=True):
+                        with autocast(self.device.type, cache_enabled=True):
                             output = self.model(inputs, targets=targets)
-                        with autocast(self.device, enabled=False):
+                        with autocast(self.device.type, enabled=False):
                             loss_dict = self.loss_fn(output, targets)
                         loss = sum(loss_dict.values()) / self.b_accum_steps
                         self.scaler.scale(loss).backward()
@@ -495,6 +496,7 @@ class Trainer_DDP:
         self.decision_metrics = cfg.train.decision_metrics
 
         self.rank, self.local_rank, self.world_size = setup_ddp()
+        logger.info(f"World size {self.world_size}")
         if torch.cuda.is_available() and requested_device.startswith("cuda"):
             self.device = torch.device(f"cuda:{self.local_rank}")
         else:
@@ -543,17 +545,13 @@ class Trainer_DDP:
         self.model = SyncBatchNorm.convert_sync_batchnorm(self.model).to(self.device) # self.device as all 
         self.model = DDP(self.model, device_ids=[self.local_rank])
 
-        if self.cfg.train.use_ema:
-            if is_main_process():
-                logger.info("Re-initialising EMA model for DDP")
-            # NOTE: use cfg.train (not cfg.train) and the underlying module for EMA
-            self.ema_model = ModelEMA(self.model.module if self.world_size > 1 else self.model, cfg.train.ema_momentum)
-
+        # Initialize EMA model
         self.ema_model = None
         if self.cfg.train.use_ema:
             if is_main_process():
                 logger.info("EMA model will be evaluated and saved")
-            self.ema_model = ModelEMA(self.model, cfg.train.ema_momentum)
+            # Use the underlying module for EMA, not the DDP wrapper
+            self.ema_model = ModelEMA(self.model.module, cfg.train.ema_momentum)
 
         self.loss_fn = build_loss(
             cfg.model_name, self.num_labels, label_smoothing=cfg.train.label_smoothing
@@ -766,7 +764,7 @@ class Trainer_DDP:
             model_to_save = self.ema_model.model
 
         # Unwrap for rank0
-        if has_attr(model_to_save, "module"):
+        if hasattr(model_to_save, "module"):
             model_to_save = model_to_save.module
 
         self.path_to_save.mkdir(parents=True, exist_ok=True)
@@ -815,7 +813,7 @@ class Trainer_DDP:
             if self.ema_model:
                 ema_iter += 1
                 # if DDP, get underlying model
-                underlying_model = self.model.module if has_attr(self.model, 'module') else self.model
+                underlying_model = self.model.module if hasattr(self.model, 'module') else self.model
                 self.ema_model.update(ema_iter, underlying_model)
 
         for epoch in range(1, self.epochs + 1):
@@ -831,54 +829,62 @@ class Trainer_DDP:
             # only rank0 should use tqdm
             with tqdm(self.train_loader, unit="batch", disable=not is_main_process()) as tepoch:
                 for batch_idx, (inputs, targets, _) in enumerate(tepoch):
-                    tepoch.set_description(f"Epoch {epoch}/{self.epochs}")
-                    if inputs is None:
-                        continue
-                    cur_iter += 1
+                    try:
+                        tepoch.set_description(f"Epoch {epoch}/{self.epochs}")
+                        if inputs is None:
+                            continue
+                        cur_iter += 1
 
-                    inputs = inputs.to(self.device)
-                    targets = [
-                        {
-                            k: (v.to(self.device) if (v is not None and hasattr(v, "to")) else v)
-                            for k, v in t.items()
-                        }
-                        for t in targets
-                    ]
+                        inputs = inputs.to(self.device)
+                        targets = [
+                            {
+                                k: (v.to(self.device) if (v is not None and hasattr(v, "to")) else v)
+                                for k, v in t.items()
+                            }
+                            for t in targets
+                        ]
 
-                    lr = self.optimizer.param_groups[-1]["lr"]
+                        lr = self.optimizer.param_groups[-1]["lr"]
 
-                    if self.amp_enabled:
-                        with autocast(self.device.type, cache_enabled=True):
+                        if self.amp_enabled:
+                            with autocast(self.device.type, cache_enabled=True):
+                                output = self.model(inputs, targets=targets)
+                            with autocast(self.device.type, enabled=False):
+                                loss_dict = self.loss_fn(output, targets)
+                            loss = sum(loss_dict.values()) / self.b_accum_steps
+                            self.scaler.scale(loss).backward()
+
+                        else:
                             output = self.model(inputs, targets=targets)
-                        with autocast(self.device.type, enabled=False):
                             loss_dict = self.loss_fn(output, targets)
-                        loss = sum(loss_dict.values()) / self.b_accum_steps
-                        self.scaler.scale(loss).backward()
+                            loss = sum(loss_dict.values()) / self.b_accum_steps
+                            loss.backward()
 
-                    else:
-                        output = self.model(inputs, targets=targets)
-                        loss_dict = self.loss_fn(output, targets)
-                        loss = sum(loss_dict.values()) / self.b_accum_steps
-                        loss.backward()
+                        if (batch_idx + 1) % self.b_accum_steps == 0:
+                            optimizer_step(step_scheduler=True)
 
-                    if (batch_idx + 1) % self.b_accum_steps == 0:
-                        optimizer_step(step_scheduler=True)
+                        losses.append(loss.item())
 
-                    losses.append(loss.item())
-
-                    if is_main_process():
-                        tepoch.set_postfix(
-                            loss=np.mean(losses) * self.b_accum_steps,
-                            eta=calculate_remaining_time(
-                                one_epoch_time,
-                                epoch_start_time,
-                                epoch,
-                                self.epochs,
-                                cur_iter,
-                                len(self.train_loader),
-                            ),
-                            vram=f"{get_vram_usage()}%",
-                        )
+                        if is_main_process():
+                            tepoch.set_postfix(
+                                loss=np.mean(losses) * self.b_accum_steps,
+                                eta=calculate_remaining_time(
+                                    one_epoch_time,
+                                    epoch_start_time,
+                                    epoch,
+                                    self.epochs,
+                                    cur_iter,
+                                    len(self.train_loader),
+                                ),
+                                vram=f"{get_vram_usage()}%",
+                            )
+                    except Exception as e:
+                        # Log error on all ranks
+                        logger.error(f"Rank {self.rank} error in batch {batch_idx}: {e}")
+                        import traceback
+                        logger.error(traceback.format_exc())
+                        # Re-raise to trigger cleanup in main()'s "finally" block
+                        raise
 
             # Final update for any leftover gradients from an incomplete accumulation step
             if (batch_idx + 1) % self.b_accum_steps != 0:
@@ -924,13 +930,19 @@ class Trainer_DDP:
 
             one_epoch_time = time.time() - epoch_start_time
 
-            # let each process stop independently but only main logs 
-            if self.early_stopping and self.early_stopping_steps >= self.early_stopping:
-                if is_main_process(): 
-                    logger.info("Early stopping")
+            # Synchronize early stopping
+            stop_training = torch.tensor(0, device=self.device)
+            if is_main_process() and self.early_stopping and self.early_stopping_steps >= self.early_stopping:
+                logger.info("Early stopping")
+                stop_training = torch.tensor(1, device=self.device)
+
+            if self.world_size > 1:
+                dist.broadcast(stop_training, 0)
+
+            if stop_training.item() == 1:
                 break
 
-        # let all ranks to finish
+        # let all ranks finish
         if self.world_size > 1:
             dist.barrier()
         
@@ -943,56 +955,166 @@ def main(cfg: DictConfig) -> None:
     else:
         trainer = Trainer(cfg)
 
+    # Store original rank for each process before any DDP cleanup for post-training evaluation
+    # After cleanup_ddp(), is_main_process() becomes unreliable because
+    # dist.is_initialized() returns False, causing get_rank() to return 0 for ALL processes
+    original_rank = trainer.rank if cfg.train.ddp else 0
+    
     try:
         t_start = time.time()
         trainer.train()
+        
+        # Clean up DDP after training completes, before finally block
+        # This ensures all ranks are synchronized before cleanup
+        if cfg.train.ddp and dist.is_initialized():
+            if is_main_process():
+                logger.info("Training completed, cleaning up DDP...")
+            cleanup_ddp()
+            
     except KeyboardInterrupt:
         if is_main_process(): # Use DDP-aware check
             logger.warning("Interrupted by user")
+        # Ensure all ranks exit cleanly
+        if cfg.train.ddp and dist.is_initialized():
+            cleanup_ddp()
+        return
     except Exception as e:
-        if is_main_process():
-            logger.error(e)
+        # Log error on all ranks for debugging
+        import traceback
+        logger.error(f"Rank {dist.get_rank() if dist.is_initialized() else 0} error: {e}")
+        logger.error(traceback.format_exc())
+        # Ensure all ranks are aware of the failure
+        if cfg.train.ddp and dist.is_initialized():
+            try:
+                # Try to synchronize before cleanup (without timeout for compatibility)
+                dist.barrier()
+            except Exception as barrier_error:
+                logger.error(f"Barrier failed during error cleanup: {barrier_error}")
+            finally:
+                cleanup_ddp()
     finally:
-        # Final eval and logging should be on rank0 only
-        if is_main_process():
+        # Only original rank 0 should run evaluation
+        # After cleanup_ddp(), is_main_process() returns True for ALL processes
+        # because dist.is_initialized() is False, so we use the captured original_rank
+        if original_rank == 0: 
             logger.info("Evaluating best model...")
             cfg.exp = get_latest_experiment_name(cfg.exp, cfg.train.path_to_save)
 
+            # Free GPU memory from training before loading evaluation model
+            # This prevents CUDA OOM when loading the evaluation model
+            if cfg.train.ddp:
+                # Delete trainer's models to free GPU memory
+                if hasattr(trainer, 'model'):
+                    del trainer.model
+                if hasattr(trainer, 'ema_model'):
+                    del trainer.ema_model
+                # Clear CUDA cache
+                torch.cuda.empty_cache()
+                import gc
+                gc.collect()
+            
+            # For DDP, ensure we use cuda:0 for main process evaluation
+            eval_device = torch.device('cuda:0') if cfg.train.ddp else (trainer.device if hasattr(trainer, 'device') else cfg.train.device)
+            
             model = build_model(
                 cfg.model_name,
                 len(cfg.train.label_to_name),
-                cfg.train.device,
+                eval_device,
                 img_size=cfg.train.img_size,
             )
             model.load_state_dict(
                 torch.load(Path(cfg.train.path_to_save) / "model.pt", weights_only=True)
             )
-            if trainer.ema_model:
-                trainer.ema_model.model = model
-            else:
-                trainer.model = model
-
-            val_metrics = trainer.evaluate(
-                val_loader=trainer.val_loader,
-                conf_thresh=trainer.conf_thresh,
-                iou_thresh=trainer.iou_thresh,
-                path_to_save=Path(cfg.train.path_to_save),
-                extended=True,
-                mode="val",
-            )
-            if cfg.train.use_wandb:
-                wandb_logger(None, val_metrics, epoch=cfg.train.epochs + 1, mode="val")
-
-            test_metrics = {}
-            if trainer.test_loader:
-                test_metrics = trainer.evaluate(
-                    val_loader=trainer.test_loader,
+            # Ensure model is on the correct device
+            model = model.to(eval_device)
+            
+            # For DDP: need to create a fresh non-DDP dataloader for evaluation
+            # since DDP has been cleaned up
+            if cfg.train.ddp:
+                # Create a new dataloader without DDP sampler
+                from src.dl.dataset import Loader
+                base_loader = Loader(
+                    root_path=Path(cfg.train.data_path),
+                    img_size=tuple(cfg.train.img_size),
+                    batch_size=cfg.train.batch_size,
+                    num_workers=cfg.train.num_workers,
+                    cfg=cfg,
+                    debug_img_processing=cfg.train.debug_img_processing,
+                )
+                _, eval_val_loader, eval_test_loader = base_loader.build_dataloaders()
+                
+                # Create a minimal evaluation wrapper without initializing a full Trainer
+                # This avoids device conflicts from Trainer.__init__ building its own model
+                class EvalWrapper:
+                    def __init__(self, model, device, cfg, trainer_cfg):
+                        self.model = model
+                        self.device = device
+                        self.ema_model = None  # No EMA for final eval
+                        self.num_labels = len(cfg.train.label_to_name)
+                        self.keep_ratio = trainer_cfg.keep_ratio
+                        self.amp_enabled = cfg.train.amp_enabled
+                        self.to_visualize_eval = trainer_cfg.to_visualize_eval
+                        self.label_to_name = cfg.train.label_to_name
+                        self.cfg = cfg
+                        self.conf_thresh = cfg.train.conf_thresh
+                        self.eval_preds_path = Path(cfg.train.eval_preds_path)
+                    
+                    # Copy the methods from Trainer_DDP
+                    preds_postprocess = staticmethod(Trainer_DDP.preds_postprocess)
+                    gt_postprocess = staticmethod(Trainer_DDP.gt_postprocess)
+                    get_preds_and_gt = Trainer_DDP.get_preds_and_gt
+                    get_metrics = staticmethod(Trainer_DDP.get_metrics)
+                    evaluate = Trainer_DDP.evaluate
+                
+                eval_wrapper = EvalWrapper(model, eval_device, cfg, trainer)
+                
+                val_metrics = eval_wrapper.evaluate(
+                    val_loader=eval_val_loader,
                     conf_thresh=trainer.conf_thresh,
                     iou_thresh=trainer.iou_thresh,
                     path_to_save=Path(cfg.train.path_to_save),
                     extended=True,
-                    mode="test",
+                    mode="val",
                 )
+            else:
+                # Single GPU: can use trainer's evaluate method
+                if trainer.ema_model:
+                    trainer.ema_model.model = model.to(eval_device)
+                else:
+                    trainer.model = model.to(eval_device)
+
+                val_metrics = trainer.evaluate(
+                    val_loader=trainer.val_loader,
+                    conf_thresh=trainer.conf_thresh,
+                    iou_thresh=trainer.iou_thresh,
+                    path_to_save=Path(cfg.train.path_to_save),
+                    extended=True,
+                    mode="val",
+                )
+            if cfg.train.use_wandb:
+                wandb_logger(None, val_metrics, epoch=cfg.train.epochs + 1, mode="val")
+
+            test_metrics = {}
+            if cfg.train.ddp:
+                if eval_test_loader:
+                    test_metrics = eval_wrapper.evaluate(
+                        val_loader=eval_test_loader,
+                        conf_thresh=trainer.conf_thresh,
+                        iou_thresh=trainer.iou_thresh,
+                        path_to_save=Path(cfg.train.path_to_save),
+                        extended=True,
+                        mode="test",
+                    )
+            else:
+                if trainer.test_loader:
+                    test_metrics = trainer.evaluate(
+                        val_loader=trainer.test_loader,
+                        conf_thresh=trainer.conf_thresh,
+                        iou_thresh=trainer.iou_thresh,
+                        path_to_save=Path(cfg.train.path_to_save),
+                        extended=True,
+                        mode="test",
+                    )
                 if cfg.train.use_wandb:
                     wandb_logger(None, test_metrics, epoch=-1, mode="test")
 
@@ -1003,8 +1125,6 @@ def main(cfg: DictConfig) -> None:
                 extended=True,
             )
             logger.info(f"Full training time: {(time.time() - t_start) / 60 / 60:.2f} hours")
-
-        cleanup_ddp()
 
 if __name__ == "__main__":
     main()

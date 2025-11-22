@@ -689,8 +689,7 @@ def setup_ddp():
     Initializes the DDP process group
     """
     num_gpus = torch.accelerator.device_count()
-    assert num_gpus >= 2, f"DDP requires > 2 GPUs but got {num_gpus}"
-
+    assert num_gpus >= 2, f"DDP requires >= 2 GPUs but got {num_gpus}"
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     rank = int(os.environ.get("RANK", 0))
@@ -708,7 +707,9 @@ def setup_ddp():
     return rank, local_rank, world_size
 
 def get_rank() -> int:
-    return dist.get_rank()
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank()
+    return 0
 
 def is_main_process() -> bool:
     """
