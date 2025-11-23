@@ -9,7 +9,7 @@ train:
   ### Paths ###
   root: /home/samal/smol_data/ # project root with dataset and outputs
   pretrained_dataset: obj2coco # coco, obj2coco
-  pretrained_model_path: /home/samal/smol_data/output/models/baseline_2025-11-22/last.pt #pretrained/dfine_${model_name}_${train.pretrained_dataset}.pth # dfine_m_obj2coco.pth
+  pretrained_model_path: pretrained/dfine_${model_name}_${train.pretrained_dataset}.pth # dfine_m_obj2coco.pth
 
   data_path: ${train.root} # path to dataset
   path_to_test_data: ${train.root}/VisDrone2019-DET-test-dev/images  # path to test set, used in infer script
@@ -23,7 +23,7 @@ train:
   ### Configs ###
   use_wandb: False
   ddp: True # toggled using CLI 
-  device: cuda:1 # only for single-gpu training | For DDP, this is the rank 0 device
+  device: cuda:1 # only for single-gpu training 
   label_to_name: # dataset's classes
     0: ball
 
@@ -44,9 +44,9 @@ train:
   batch_size: 44 #8 # physical, should fit on the device
   b_accum_steps: 1 # grad accumulation (n * bs)
   epochs: 55
-  early_stopping: 1 # 0 - no early stopping
+  early_stopping: 4 # 0 - no early stopping
   ignore_background_epochs: 0 # background images are not used for N epochs in train set
-  num_workers: 4 #4 #12
+  num_workers: 12
 
   ### Validation ###
   conf_thresh: 0.5
